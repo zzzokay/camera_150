@@ -6,7 +6,7 @@
 - 单目相机标定结果 `camera_usb3_calib.npz`；
 - RKNNLite 人物检测模型与标签文件；
 - 单路画面的人物检测、检测框平滑、战团/热点分析、导播窗口决策；
-- 1280x720 运镜画面预览、截图与本地 H.264 录制。
+- 1280x720 运镜画面预览、截图、本地 H.264 录制与局域网 RTSP/UDP 网络推流。
 
 > 当前工程是“单路摄像头”版本：只做单目 undistort，不做 stereoRectify、双目极线矫正、左右路 remap、拼接或 overlap mask。
 
@@ -19,6 +19,7 @@
 ├── README.md
 ├── calib_usb3_camera_150.py
 ├── camera_usb3_calib.npz
+├── mediamtx_rk3588.yml
 ├── calib_usb3_images/
 │   ├── raw_000.jpg
 │   ├── raw_001.jpg
@@ -29,11 +30,13 @@
 └── camera_movement_modified/
     ├── single_rknn_base.py
     ├── single_rknn_director_view720_record_local.py
+    ├── single_rknn_director_view720_network_stream.py
     ├── single_rknn_director_view1920_record_local.py
     ├── predict1_weighted.py
     ├── predict1_director.py
     ├── debug_view1920/
-    └── director_videos/
+    ├── director_videos/
+    └── stream_logs/
 ```
 
 ### 关键文件说明
@@ -48,8 +51,11 @@
 | `camera_movement_modified/single_rknn_base.py` | 通用基础模块：摄像头后台采集、校准文件加载、RKNN 检测、NMS、检测框平滑、FPS 等。 |
 | `camera_movement_modified/predict1_weighted.py` | 单图战团/热点分析逻辑：人物过滤、主战区选择、热点预测、快攻判断、纵向构图等。 |
 | `camera_movement_modified/predict1_director.py` | 导播窗口和镜头状态机：左/中/右窗口、pan 惯性、zoom、导播框平滑等。 |
-| `camera_movement_modified/single_rknn_director_view720_record_local.py` | 推荐主程序：单路 USB3 + RKNN + 单目矫正 + 样本同款导播框 + 1280x720 输出和录制。 |
+| `camera_movement_modified/single_rknn_director_view720_record_local.py` | 推荐本地录制主程序：单路 USB3 + RKNN + 单目矫正 + 样本同款导播框 + 1280x720 输出和录制。 |
+| `camera_movement_modified/single_rknn_director_view720_network_stream.py` | 网络推流主程序：在 720p 运镜输出后接入 FFmpeg，支持 RTSP/UDP、watchdog 心跳和断连自动重连。 |
 | `camera_movement_modified/single_rknn_director_view1920_record_local.py` | 旧版/legacy 运镜主程序：使用锚点和缩放直接裁切输出。 |
+| `mediamtx_rk3588.yml` | MediaMTX RTSP 服务器配置文件，用于接收 FFmpeg 推流并给 VLC/OBS/ffplay 拉流。 |
+| `camera_movement_modified/stream_logs/` | 网络推流 FFmpeg 日志目录，用于排查推流失败、编码器异常和断连重启。 |
 | `camera_movement_modified/debug_view1920/` | 按 `s` 保存调试截图的默认目录。 |
 | `camera_movement_modified/director_videos/` | 按 `r` 或空格录制本地运镜视频的默认目录。 |
 
@@ -87,23 +93,26 @@ python3 -c "from rknnlite.api import RKNNLite; print('RKNNLite OK')"
 
 ### 系统依赖
 
-录制功能依赖 `ffmpeg`：
+本地录制和网络推流都依赖 `ffmpeg`：
 
 ```bash
 ffmpeg -version
 ```
 
-默认录制编码器是 `h264_rkmpp`，适合 RK3588 硬件编码。如果当前系统的 ffmpeg 不支持该编码器，可以改用软件编码器：
+默认录制和推流编码器都是 `h264_rkmpp`，适合 RK3588 硬件编码。先查看当前 FFmpeg 是否支持 Rockchip MPP 编码器：
+
+```bash
+ffmpeg -hide_banner -encoders | grep rkmpp
+```
+
+如果能看到 `h264_rkmpp`，说明可以使用硬件编码。如果当前系统的 FFmpeg 不支持该编码器，可以临时改用软件编码器测试：
 
 ```bash
 --record-encoder libx264
+--stream-encoder libx264
 ```
 
-或先查看可用编码器：
-
-```bash
-ffmpeg -encoders | grep h264
-```
+网络 RTSP 推流推荐配合 `MediaMTX` 使用。MediaMTX 负责接收 FFmpeg 推上来的视频流，并向 VLC、OBS、ffplay 等客户端提供 RTSP 拉流地址。
 
 ---
 
@@ -368,6 +377,222 @@ single_director_view720_YYYYMMDD_HHMMSS_mmm.ffmpeg.log
 
 ---
 
+## 网络推流主程序
+
+网络推流版本使用：
+
+```text
+camera_movement_modified/single_rknn_director_view720_network_stream.py
+```
+
+它在本地运镜主程序的基础上新增了网络输出：
+
+```text
+USB 摄像头
+    ↓
+单目畸变矫正 undistort
+    ↓
+RKNN 人物检测
+    ↓
+predict1_weighted / predict1_director 自动运镜
+    ↓
+1280x720 view 输出
+    ↓
+FFmpeg h264_rkmpp 编码
+    ↓
+MediaMTX RTSP 服务
+    ↓
+VLC / OBS / ffplay 拉流观看
+```
+
+### 推荐网络推流方案
+
+正式使用推荐：
+
+```text
+Python 运镜脚本 → FFmpeg → MediaMTX → VLC
+```
+
+其中：
+
+| 模块 | 作用 |
+| --- | --- |
+| `single_rknn_director_view720_network_stream.py` | 生成 1280x720 运镜画面，并把画面送给 FFmpeg。 |
+| `FFmpeg` | 将 OpenCV BGR 图像编码成 H.264 网络流。 |
+| `h264_rkmpp` | RK3588 硬件 H.264 编码器，降低 CPU 占用。 |
+| `MediaMTX` | RTSP 服务器，接收 FFmpeg 推流，并让 VLC 拉流。 |
+| `VLC` | 电脑端播放网络串流。 |
+
+### MediaMTX 配置
+
+配置文件为：
+
+```text
+/home/elf/work/camera_150/mediamtx_rk3588.yml
+```
+
+内容如下：
+
+```yaml
+rtspAddress: :8554
+
+paths:
+  director:
+    source: publisher
+```
+
+含义：
+
+- `rtspAddress: :8554`：RK3588 在 8554 端口提供 RTSP 服务；
+- `director`：视频流路径名；
+- `source: publisher`：允许 FFmpeg 主动推流到这个路径。
+
+### 启动 MediaMTX
+
+建议把 MediaMTX 放到单独目录：
+
+```bash
+mkdir -p ~/stream_server
+cd ~/stream_server
+```
+
+把配置文件复制过去：
+
+```bash
+cp /home/elf/work/camera_150/mediamtx_rk3588.yml ~/stream_server/
+```
+
+启动 RTSP 服务器：
+
+```bash
+cd ~/stream_server
+./mediamtx mediamtx_rk3588.yml
+```
+
+这个终端不要关闭。正常启动后，MediaMTX 会监听：
+
+```text
+rtsp://RK3588的IP:8554/director
+```
+
+### 启动网络推流脚本
+
+另开一个终端运行：
+
+```bash
+cd /home/elf/work/camera_150/camera_movement_modified
+
+python3 single_rknn_director_view720_network_stream.py \
+  --device /dev/video41 \
+  --width 1920 \
+  --height 1080 \
+  --fps 30 \
+  --calib-file /home/elf/work/camera_150/camera_usb3_calib.npz \
+  --model /home/elf/work/camera_150/model/basketball_player_fp_2.1.0.rknn \
+  --labels /home/elf/work/camera_150/model/labels.txt \
+  --view-width 1280 \
+  --view-height 720 \
+  --render-mode sample \
+  --detect-interval 3 \
+  --conf 0.25 \
+  --nms 0.45 \
+  --stream-mode rtsp \
+  --stream-url rtsp://127.0.0.1:8554/director \
+  --stream-fps 25 \
+  --stream-bitrate 4M \
+  --stream-encoder h264_rkmpp \
+  --save-dir /home/elf/work/camera_150/camera_movement_modified/debug_view1920 \
+  --stream-log-dir /home/elf/work/camera_150/camera_movement_modified/stream_logs
+```
+
+### VLC 拉流
+
+在 RK3588 上查看 IP：
+
+```bash
+hostname -I
+```
+
+假设 RK3588 的 IP 是：
+
+```text
+192.168.1.66
+```
+
+电脑 VLC 打开：
+
+```text
+媒体 → 打开网络串流
+```
+
+输入：
+
+```text
+rtsp://192.168.1.66:8554/director
+```
+
+注意不要进入 `媒体 → 串流`，那个页面是让 VLC 自己推流，不是用来观看 RK3588 推流的。
+
+### Watchdog 心跳机制
+
+网络推流脚本内部有两个后台线程：
+
+| 线程 | 作用 |
+| --- | --- |
+| writer 线程 | 从最新帧缓冲区取出运镜画面，按 `--stream-fps` 写入 FFmpeg。 |
+| watchdog 线程 | 定期检查 FFmpeg 进程、RTSP 端口、写入心跳和断管状态。 |
+
+异常处理逻辑：
+
+```text
+FFmpeg 崩溃 / RTSP 服务断开 / BrokenPipe / 写入超时
+        ↓
+watchdog 检测到异常
+        ↓
+停止旧 FFmpeg 进程
+        ↓
+重新启动 FFmpeg
+        ↓
+继续推最新的运镜画面
+```
+
+推流缓冲采用“只保留最新帧”策略：
+
+```text
+新 view 到来 → 覆盖旧 view → 推流线程只拿最新 view
+```
+
+这样网络短暂卡顿后不会慢慢补发旧帧，能够避免 VLC 画面延迟越积越大。
+
+### UDP 快速测试
+
+如果暂时不使用 MediaMTX，也可以直接 UDP 推流到电脑。假设电脑 IP 是 `192.168.1.88`：
+
+```bash
+cd /home/elf/work/camera_150/camera_movement_modified
+
+python3 single_rknn_director_view720_network_stream.py \
+  --device /dev/video41 \
+  --calib-file /home/elf/work/camera_150/camera_usb3_calib.npz \
+  --model /home/elf/work/camera_150/model/basketball_player_fp_2.1.0.rknn \
+  --labels /home/elf/work/camera_150/model/labels.txt \
+  --stream-mode udp \
+  --dst-ip 192.168.1.88 \
+  --stream-port 1234 \
+  --stream-fps 25 \
+  --stream-bitrate 4M \
+  --stream-encoder h264_rkmpp
+```
+
+电脑 VLC 打开：
+
+```text
+udp://@:1234
+```
+
+UDP 模式适合快速验证，但正式演示更推荐 RTSP + MediaMTX，因为 RTSP 地址固定，客户端拉流更方便，也更适合 watchdog 判断连接状态。
+
+
 ## 主程序参数说明
 
 ### 摄像头与标定参数
@@ -421,6 +646,26 @@ single_director_view720_YYYYMMDD_HHMMSS_mmm.ffmpeg.log
 | `--record-overlay` | 关闭 | 打开后录制带检测框/状态文字的预览画面。 |
 | `--print-every` | `30` | 每隔 N 帧打印一行 profile；设为 `0` 可关闭。 |
 
+### 网络推流参数
+
+| 参数 | 默认值 | 说明 |
+| --- | --- | --- |
+| `--stream-mode` | `rtsp` | 网络推流协议。正式使用推荐 `rtsp`，快速测试可用 `udp`。 |
+| `--stream-url` | 空 | 完整推流地址。不填时 RTSP 默认 `rtsp://127.0.0.1:8554/director`。 |
+| `--dst-ip` | 空 | UDP 模式下的电脑 IP，例如 `192.168.1.88`。 |
+| `--stream-port` | `1234` | UDP 端口。VLC 拉流时使用 `udp://@:1234`。 |
+| `--stream-fps` | `25.0` | 网络推流帧率。720p 推荐先用 `25`，稳定后再试 `30`。 |
+| `--stream-bitrate` | `4M` | 网络推流码率。720p 推荐 `3M~4M`，1080p 可尝试 `6M~8M`。 |
+| `--stream-encoder` | `h264_rkmpp` | 推流编码器。RK3588 推荐硬编码 `h264_rkmpp`。 |
+| `--stream-overlay` | 关闭 | 默认推干净运镜画面；打开后推带检测框、FPS 和状态文字的调试画面。 |
+| `--stream-log-dir` | `./stream_logs` | FFmpeg 推流日志目录。 |
+| `--ffmpeg-bin` | `ffmpeg` | FFmpeg 可执行文件路径。 |
+| `--ffmpeg-loglevel` | `warning` | FFmpeg 日志等级。 |
+| `--no-rtsp-check` | 关闭 | 关闭 RTSP 服务端口检查。一般不建议关闭。 |
+| `--stream-watchdog-interval` | `2.0` | watchdog 检查间隔，单位秒。 |
+| `--stream-heartbeat-timeout` | `8.0` | 推流写入心跳超时，单位秒。 |
+| `--stream-restart-backoff` | `2.0` | FFmpeg 最小重启间隔，避免异常时疯狂重启。 |
+
 ---
 
 ## 两个运镜脚本的区别
@@ -436,6 +681,19 @@ single_director_view720_YYYYMMDD_HHMMSS_mmm.ffmpeg.log
 - 更接近“样本同款运镜”的左右窗口、停顿、回中和侧边驻留节奏。
 
 适合实际使用和录制。
+
+### `single_rknn_director_view720_network_stream.py`（网络推流版）
+
+特点：
+
+- 复用 720p 本地运镜主程序的畸变矫正、RKNN 检测、人物平滑和导播裁切逻辑；
+- 在最终 `view` 输出后接入 FFmpeg 管道；
+- 支持 RTSP + MediaMTX，也支持 UDP 直推；
+- 推流默认使用 `h264_rkmpp` 硬编码；
+- 内置 watchdog 心跳机制，FFmpeg 崩溃、RTSP 服务重启或管道断开后会自动重连；
+- 推流缓冲只保留最新帧，旧帧直接丢弃，避免延迟堆积。
+
+适合局域网实时观看、答辩展示、OBS 接入和远程调试。
 
 ### `single_rknn_director_view1920_record_local.py`（旧版/legacy）
 
@@ -535,7 +793,52 @@ person
 
 ## 常用运行场景
 
-### 1. 只预览，不录制
+### 1. RTSP 网络推流给 VLC 观看
+
+终端 1 启动 MediaMTX：
+
+```bash
+cd ~/stream_server
+./mediamtx mediamtx_rk3588.yml
+```
+
+终端 2 启动运镜推流：
+
+```bash
+cd /home/elf/work/camera_150/camera_movement_modified
+
+python3 single_rknn_director_view720_network_stream.py   --device /dev/video41   --calib-file /home/elf/work/camera_150/camera_usb3_calib.npz   --model /home/elf/work/camera_150/model/basketball_player_fp_2.1.0.rknn   --labels /home/elf/work/camera_150/model/labels.txt   --render-mode sample   --stream-mode rtsp   --stream-url rtsp://127.0.0.1:8554/director   --stream-fps 25   --stream-bitrate 4M   --stream-encoder h264_rkmpp
+```
+
+电脑 VLC 打开：
+
+```text
+rtsp://RK3588的IP:8554/director
+```
+
+### 2. 推带调试框的网络画面
+
+默认推流的是干净运镜画面。如果希望 VLC 里看到检测框、FPS、crop 和 stream 状态，加：
+
+```bash
+--stream-overlay
+```
+
+### 3. 无窗口网络推流
+
+无显示器或 SSH 远程运行时，加：
+
+```bash
+--headless
+```
+
+例如：
+
+```bash
+python3 single_rknn_director_view720_network_stream.py   --headless   --device /dev/video41   --calib-file /home/elf/work/camera_150/camera_usb3_calib.npz   --model /home/elf/work/camera_150/model/basketball_player_fp_2.1.0.rknn   --labels /home/elf/work/camera_150/model/labels.txt   --stream-mode rtsp   --stream-url rtsp://127.0.0.1:8554/director
+```
+
+### 4. 只预览，不录制
 
 ```bash
 cd /home/elf/work/camera_150/camera_movement_modified
@@ -547,7 +850,7 @@ python3 single_rknn_director_view720_record_local.py \
   --display-scale 0.5
 ```
 
-### 2. 无窗口运行，只打印 profile
+### 5. 无窗口运行，只打印 profile
 
 ```bash
 cd /home/elf/work/camera_150/camera_movement_modified
@@ -560,7 +863,7 @@ python3 single_rknn_director_view720_record_local.py \
   --print-every 30
 ```
 
-### 3. 降低 NPU 压力
+### 6. 降低 NPU 压力
 
 增大检测间隔：
 
@@ -574,7 +877,7 @@ python3 single_rknn_director_view720_record_local.py \
 --rknn-core 0
 ```
 
-### 4. 提高检测召回
+### 7. 提高检测召回
 
 如果漏人较多，可以降低检测阈值：
 
@@ -588,7 +891,7 @@ python3 single_rknn_director_view720_record_local.py \
 --conf 0.35
 ```
 
-### 5. 切换到软件 H.264 编码
+### 8. 切换到软件 H.264 编码
 
 当 `h264_rkmpp` 不可用时：
 
@@ -596,7 +899,7 @@ python3 single_rknn_director_view720_record_local.py \
 --record-encoder libx264 --record-bitrate 6M
 ```
 
-### 6. 录制带调试信息的视频
+### 9. 录制带调试信息的视频
 
 ```bash
 --record-overlay
@@ -727,7 +1030,90 @@ RKNN runtime 初始化失败
 - `predict1_weighted.py`：人物过滤、热点、快攻、主战区相关参数；
 - `predict1_director.py`：窗口切换、pan 惯性、zoom、停顿和导播框相关参数。
 
-### 8. 导入 `predict1_yolo` 失败
+### 8. MediaMTX 启动了，但 FFmpeg 推流失败
+
+先确认 8554 端口是否在监听：
+
+```bash
+ss -lntp | grep 8554
+```
+
+如果没有输出，说明 MediaMTX 没有启动或配置文件不对。重新启动：
+
+```bash
+cd ~/stream_server
+./mediamtx mediamtx_rk3588.yml
+```
+
+如果推流脚本反复提示 `RTSP 服务暂不可连接`，说明脚本的 `--stream-url` 和 MediaMTX 的地址不一致。推荐使用：
+
+```bash
+--stream-url rtsp://127.0.0.1:8554/director
+```
+
+### 9. VLC 打不开 RTSP 地址
+
+检查三个点：
+
+1. 电脑和 RK3588 是否在同一个局域网；
+2. RK3588 IP 是否正确：
+
+   ```bash
+   hostname -I
+   ```
+
+3. VLC 是否使用了正确入口：
+
+   ```text
+   媒体 → 打开网络串流
+   ```
+
+不要进入 `媒体 → 串流`，那个页面是 VLC 自己向外推流。
+
+VLC 地址格式：
+
+```text
+rtsp://RK3588的IP:8554/director
+```
+
+### 10. 网络画面延迟逐渐变大
+
+网络推流脚本已经采用“只保留最新帧”的策略，正常不会无限积压旧帧。如果 VLC 端仍然延迟较大，可以调低 VLC 网络缓存：
+
+```text
+工具 → 偏好设置 → 输入/编解码器 → 网络缓存
+```
+
+建议先试：
+
+```text
+100 ms ~ 300 ms
+```
+
+如果网络不稳定，可以把推流参数降低：
+
+```bash
+--stream-fps 20
+--stream-bitrate 3M
+```
+
+### 11. 没有 `h264_rkmpp` 编码器
+
+先检查：
+
+```bash
+ffmpeg -hide_banner -encoders | grep rkmpp
+```
+
+如果没有输出，可以临时改用软件编码：
+
+```bash
+--stream-encoder libx264
+```
+
+但软件编码会占用更多 CPU，正式运行建议安装支持 Rockchip MPP 的 FFmpeg。
+
+### 12. 导入 `predict1_yolo` 失败
 
 `predict1_director.py` 顶部引用了：
 
@@ -804,6 +1190,32 @@ python3 single_rknn_director_view720_record_local.py \
 
 ---
 
+### 日常网络推流
+
+如果已经确认本地运镜正常，日常网络推流按下面顺序：
+
+1. RK3588 终端 1：
+
+   ```bash
+   cd ~/stream_server
+   ./mediamtx mediamtx_rk3588.yml
+   ```
+
+2. RK3588 终端 2：
+
+   ```bash
+   cd /home/elf/work/camera_150/camera_movement_modified
+   python3 single_rknn_director_view720_network_stream.py      --device /dev/video41      --calib-file /home/elf/work/camera_150/camera_usb3_calib.npz      --model /home/elf/work/camera_150/model/basketball_player_fp_2.1.0.rknn      --labels /home/elf/work/camera_150/model/labels.txt      --render-mode sample      --stream-mode rtsp      --stream-url rtsp://127.0.0.1:8554/director      --stream-fps 25      --stream-bitrate 4M      --stream-encoder h264_rkmpp
+   ```
+
+3. 电脑 VLC：
+
+   ```text
+   rtsp://RK3588的IP:8554/director
+   ```
+
+---
+
 ## 当前工程状态摘要
 
 - 已有 32 张 USB 摄像头标定原图；
@@ -812,5 +1224,8 @@ python3 single_rknn_director_view720_record_local.py \
 - 当前 RMS 为约 `0.755`，属于正常可用范围；
 - RKNN 模型文件已放在 `model/` 下；
 - 标签文件当前只包含 `person`；
-- 推荐运行 `single_rknn_director_view720_record_local.py`，使用 `--render-mode sample` 输出 1280x720 运镜画面；
-- 运行时建议显式传入 `camera_150` 目录下的模型、标签、标定、截图和录制路径，避免使用旧工程 `/home/elf/work/basketball/...` 默认路径。
+- 本地预览和录制推荐运行 `single_rknn_director_view720_record_local.py`，使用 `--render-mode sample` 输出 1280x720 运镜画面；
+- 局域网网络推流推荐运行 `single_rknn_director_view720_network_stream.py`，使用 RTSP + MediaMTX + VLC；
+- 网络推流默认使用 `h264_rkmpp` 硬编码，推流地址为 `rtsp://127.0.0.1:8554/director`，VLC 拉流地址为 `rtsp://RK3588的IP:8554/director`；
+- 推流脚本内置 watchdog 心跳，支持 FFmpeg 崩溃、RTSP 服务重启、管道断开后的自动重连；
+- 运行时建议显式传入 `camera_150` 目录下的模型、标签、标定、截图、录制和推流日志路径，避免使用旧工程 `/home/elf/work/basketball/...` 默认路径。
