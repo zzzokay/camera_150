@@ -1,0 +1,16 @@
+{
+  "home_name": "主队",
+  "away_name": "客队",
+  "players": {
+    "home": [
+      {"number": "7", "name": "詹嘉裕"},
+      {"number": "11", "name": "陈浩年"},
+      {"number": "23", "name": "韦泽友"}
+    ],
+    "away": [
+      {"number": "3", "name": "张三"},
+      {"number": "8", "name": "李四"},
+      {"number": "10", "name": "王五"}
+    ]
+  }
+}

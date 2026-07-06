@@ -1,0 +1,2 @@
+av_interleaved_write_frame(): Broken pipe
+[out#0/rtsp @ 0x559037c200] Error muxing a packet

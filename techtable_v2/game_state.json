@@ -1,0 +1,58 @@
+{
+  "version": 2,
+  "home_name": "主队",
+  "away_name": "客队",
+  "home_score": 3,
+  "away_score": 1,
+  "home_fouls": 0,
+  "away_fouls": 0,
+  "period": 1,
+  "period_minutes": 10,
+  "clock_sec_left": 600,
+  "clock_running": false,
+  "selected_player": null,
+  "players": {
+    "home": [
+      {
+        "number": "7",
+        "name": "詹嘉裕",
+        "points": 0,
+        "fouls": 0
+      },
+      {
+        "number": "11",
+        "name": "陈浩年",
+        "points": 0,
+        "fouls": 0
+      },
+      {
+        "number": "23",
+        "name": "韦泽友",
+        "points": 0,
+        "fouls": 0
+      }
+    ],
+    "away": [
+      {
+        "number": "3",
+        "name": "张三",
+        "points": 0,
+        "fouls": 0
+      },
+      {
+        "number": "8",
+        "name": "李四",
+        "points": 0,
+        "fouls": 0
+      },
+      {
+        "number": "10",
+        "name": "王五",
+        "points": 0,
+        "fouls": 0
+      }
+    ]
+  },
+  "last_event": "主队 +2",
+  "updated_at_ms": 1783266031115
+}

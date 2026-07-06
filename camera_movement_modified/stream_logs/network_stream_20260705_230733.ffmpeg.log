@@ -1,0 +1,4 @@
+av_interleaved_write_frame(): Broken pipe
+[out#0/rtsp @ 0x5585005200] Error muxing a packet
+av_interleaved_write_frame(): Broken pipe
+[out#0/rtsp @ 0x556d077200] Error muxing a packet
