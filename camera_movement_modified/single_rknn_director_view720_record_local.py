@@ -1,30 +1,81 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-单路 USB3 摄像头 + RKNN 检测 + 单目畸变矫正 + 样本同款运镜 + 1280x720 输出。
+单路 USB3 摄像头 + RKNN 人体检测 + 单目畸变矫正 + 样本同款运镜 + 1280x720 本地录制。
 
-流程：
-    1. 单路摄像头后台采集 raw frame。
-    2. 使用 /home/elf/work/basketball/camera_usb3_calib.npz 做单目 undistort。
-    3. 在 undistorted frame 上做 RKNN person 检测。
-    4. 检测框直接作为单图坐标送入 predict1_weighted / predict1_director。
-    5. 使用 predict1_director.py 中的样本导播框逻辑做裁切，并适配 1280x720 输出。
+这个脚本的定位：
+    - 输入：单个 USB 摄像头画面，一般是 1920x1080@30。
+    - 矫正：使用单目标定文件 camera_usb3_calib.npz 做普通 undistort。
+    - 检测：在矫正后的单目画面上跑 RKNN person 检测。
+    - 运镜：复用 predict1_weighted.py / predict1_director.py 的导播逻辑。
+    - 输出：把导播裁切后的画面 resize 成 1280x720。
+    - 录制：按 r / Space 使用 ffmpeg 异步保存本地 mp4。
 
-本脚本不加载 stereo rectification maps，不加载 stitch params，也不做极线矫正。
+重要区别：
+    本脚本不加载 stereo rectification maps，不加载 stitch params，不做双目极线矫正，
+    也不做左右图拼接。这里的 wide 坐标只是为了复用旧代码命名，实际就是单图坐标。
+
+典型运行：
+
+    # 1. 最常用：USB3 单目矫正 + RKNN 检测 + 样本同款运镜 + 720p 预览
+    python3 camera_movement_modified/single_rknn_director_view720_record_local.py \
+      --device /dev/video41 \
+      --calib-file /home/elf/work/basketball/camera_usb3_calib.npz \
+      --model /home/elf/work/basketball/model/basketball_player_fp_2.1.0.rknn \
+      --labels /home/elf/work/basketball/model/labels.txt \
+      --width 1920 --height 1080 --fps 30 \
+      --detect-interval 3 \
+      --view-width 1280 --view-height 720 \
+      --display-scale 0.5
+
+    # 2. 按 r 开始/停止录制，默认录制干净 view，不带检测框和状态文字
+    #    输出目录由 --record-dir 控制，默认来自 single_rknn_base.DEFAULT_RECORD_DIR。
+    python3 camera_movement_modified/single_rknn_director_view720_record_local.py \
+      --device /dev/video41 \
+      --record-dir /home/elf/work/basketball/camera_movement_modified/director_videos
+
+    # 3. 录制带检测框、FPS、crop 信息的调试视频
+    python3 camera_movement_modified/single_rknn_director_view720_record_local.py \
+      --device /dev/video41 \
+      --record-overlay
+
+    # 4. 如果 h264_rkmpp 不可用，改用软件编码 libx264
+    python3 camera_movement_modified/single_rknn_director_view720_record_local.py \
+      --device /dev/video41 \
+      --record-encoder libx264 \
+      --record-bitrate 8M
+
+    # 5. 调试运镜但暂时不做畸变矫正
+    python3 camera_movement_modified/single_rknn_director_view720_record_local.py \
+      --device /dev/video41 \
+      --no-undistort
+
+按键：
+    r / Space  开始或停止录制 mp4
+    s          保存当前带调试文字的 view jpg
+    q / Esc    退出程序
+
+性能相关建议：
+    - --detect-interval 越大，NPU 检测越省，但目标位置更新更慢。
+    - --smooth 越大，框越稳，但会更“粘”。
+    - --record-fps 建议 20 或 30；RK3588 上优先使用 h264_rkmpp。
+    - 录制队列满时会丢旧帧，保证录制尽量贴近实时画面。
 """
 
 import argparse
 import os
-import sys
-import time
-import signal
-import types
-import subprocess
 import queue
+import signal
+import subprocess
+import sys
 import threading
+import time
+import types
 from datetime import datetime
 from typing import List, Tuple
 
+# RK3588 / Mali 平台上 OpenCV 有时会尝试启用 OpenCL。
+# 对这个实时脚本来说，OpenCL 不一定加速，反而可能带来额外初始化开销，所以先禁用。
 os.environ["OPENCV_OPENCL_RUNTIME"] = "disabled"
 
 import cv2
@@ -35,8 +86,10 @@ try:
 except Exception:
     pass
 
+
 # predict1_director.py 顶部会 import predict1_yolo.draw_boxes_on_frame。
-# 单路主脚本不依赖该模块，提供一个兜底 stub，保证 copied modified 目录可独立运行。
+# 单路主脚本不依赖该模块；如果当前目录没有 predict1_yolo.py，就提供一个 stub，
+# 这样 copied modified 目录可以独立运行，不会因为可视化函数缺失而退出。
 if "predict1_yolo" not in sys.modules:
     fake_yolo = types.ModuleType("predict1_yolo")
 
@@ -46,23 +99,28 @@ if "predict1_yolo" not in sys.modules:
     fake_yolo.draw_boxes_on_frame = _draw_boxes_on_frame_stub
     sys.modules["predict1_yolo"] = fake_yolo
 
+
 try:
     import single_rknn_base as base
 except Exception:
     print("[错误] 无法导入 single_rknn_base.py，请确认本脚本和它在同一目录。")
     raise
 
+
 try:
+    # predict1_weighted 负责把检测框转换成单路分析结果，例如目标中心、focus_y 等。
     from predict1_weighted import (
-        init_single_view_state,
-        analyze_single_view_frame,
         VERTICAL_HOME_Y_RATIO,
+        analyze_single_view_frame,
         crop_to_xyxy_safe,
+        init_single_view_state,
     )
+
+    # predict1_director 负责样本同款的导播框状态机和框坐标转换。
     from predict1_director import (
+        box_rect_to_pixels,
         init_overlay_director_state,
         update_overlay_director_state,
-        box_rect_to_pixels,
     )
 except Exception:
     print("[错误] 无法导入 predict1_weighted.py / predict1_director.py")
@@ -74,17 +132,42 @@ STOP_REQUESTED = False
 
 
 def handle_exit_signal(signum, frame):
+    """收到 Ctrl+C / kill 信号后，让主循环在当前帧处理完再安全退出。"""
     global STOP_REQUESTED
     STOP_REQUESTED = True
     print("\n[信息] 收到退出信号，当前帧结束后退出。")
 
 
 def local_timestamp() -> str:
+    """生成适合文件名使用的本地时间戳，精确到毫秒。"""
     return datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:-3]
 
 
+def bitrate_to_bufsize(bitrate: str) -> str:
+    """把 8M 这类码率粗略转换成 16M 这类 ffmpeg bufsize。"""
+    text = str(bitrate).strip()
+    if not text:
+        return "16M"
+    unit = text[-1].upper()
+    number = text[:-1]
+    if unit in ("K", "M"):
+        try:
+            return f"{max(1, int(float(number) * 2))}{unit}"
+        except ValueError:
+            return text
+    return text
+
+
 class AsyncFFmpegH264Recorder:
-    """异步 H.264 录制器，避免 ffmpeg 写入阻塞实时运镜主循环。"""
+    """
+    异步 H.264 录制器，避免 ffmpeg 写入阻塞实时运镜主循环。
+
+    工作方式：
+        1. 主循环调用 submit(frame)，把当前 view 放入队列。
+        2. 后台线程从队列里取帧，写入 ffmpeg stdin。
+        3. ffmpeg 负责 BGR rawvideo -> NV12 -> H.264 mp4。
+        4. 队列满时丢旧帧，保证录制尽量保持实时性。
+    """
 
     def __init__(
         self,
@@ -120,6 +203,7 @@ class AsyncFFmpegH264Recorder:
         self.submitted = 0
 
     def _build_cmd(self):
+        """构造 ffmpeg 命令。输入是 BGR24 原始帧，输出是 mp4。"""
         return [
             "ffmpeg",
             "-y",
@@ -134,13 +218,14 @@ class AsyncFFmpegH264Recorder:
             "-c:v", self.encoder,
             "-b:v", self.bitrate,
             "-maxrate", self.bitrate,
-            "-bufsize", str(max(1, int(float(self.bitrate[:-1]) * 2))) + self.bitrate[-1] if self.bitrate[-1].upper() in "MK" else self.bitrate,
+            "-bufsize", bitrate_to_bufsize(self.bitrate),
             "-an",
             "-movflags", "+faststart",
             self.path,
         ]
 
     def start(self, frame: np.ndarray) -> None:
+        """根据第一帧确定录制分辨率，并启动 ffmpeg 与后台写入线程。"""
         if self.is_recording:
             return
         if frame is None or frame.size == 0:
@@ -190,6 +275,7 @@ class AsyncFFmpegH264Recorder:
         self.thread.start()
 
     def submit(self, frame: np.ndarray) -> None:
+        """提交一帧给录制队列；队列满时丢旧帧再塞新帧。"""
         if not self.is_recording or self.q is None or frame is None:
             return
         if frame.shape[1] != self.frame_w or frame.shape[0] != self.frame_h:
@@ -198,6 +284,7 @@ class AsyncFFmpegH264Recorder:
 
         item = np.ascontiguousarray(frame).copy()
         self.submitted += 1
+
         try:
             self.q.put_nowait(item)
         except queue.Full:
@@ -212,6 +299,7 @@ class AsyncFFmpegH264Recorder:
                 self.dropped += 1
 
     def _writer_loop(self) -> None:
+        """后台线程：从队列取帧并写入 ffmpeg stdin。"""
         while not self.stop_event.is_set() or (self.q is not None and not self.q.empty()):
             try:
                 frame = self.q.get(timeout=0.05)
@@ -231,19 +319,23 @@ class AsyncFFmpegH264Recorder:
                 break
 
     def stop(self) -> None:
+        """停止录制并等待 ffmpeg 完成 mp4 封装。"""
         if not self.is_recording:
             return
 
         print("\n[录制] 正在停止，请稍等...")
         self.is_recording = False
         self.stop_event.set()
+
         if self.q is not None:
             try:
                 self.q.put_nowait(None)
             except Exception:
                 pass
+
         if self.thread is not None:
             self.thread.join(timeout=5.0)
+
         if self.proc is not None:
             try:
                 if self.proc.stdin is not None:
@@ -255,6 +347,7 @@ class AsyncFFmpegH264Recorder:
             except subprocess.TimeoutExpired:
                 self.proc.kill()
                 self.proc.wait(timeout=2.0)
+
         if self.log_fp is not None:
             try:
                 self.log_fp.close()
@@ -273,12 +366,18 @@ class AsyncFFmpegH264Recorder:
         print(f"  write fps : {actual:.1f}")
 
     def status_text(self) -> str:
+        """返回适合绘制到预览画面上的录制状态。"""
         if not self.is_recording:
             return "STANDBY"
         return f"REC w={self.written} q={self.q.qsize() if self.q is not None else 0} d={self.dropped}"
 
 
 def single_detections_to_boxes_info(detections) -> List[dict]:
+    """
+    把 base.WideDetection 转成 predict1_weighted / predict1_director 需要的 boxes_info。
+
+    注意：单路版本里 wide_bbox 不是双目宽图坐标，而是 undistorted 单图坐标。
+    """
     boxes = []
     for det in detections:
         x1, y1, x2, y2 = det.wide_bbox
@@ -296,6 +395,7 @@ def single_detections_to_boxes_info(detections) -> List[dict]:
 
 
 def clamp_int(value: int, low: int, high: int) -> int:
+    """把整数限制在 [low, high] 范围内。"""
     return int(max(low, min(high, value)))
 
 
@@ -321,15 +421,17 @@ def fit_box_to_output_ratio(
     # 保持样本框的下边界锚定，让画面整体偏向球场下半部。
     bottom_y = float(y2)
 
+    # 先以样本框宽度为基准，计算 16:9 高度。
     target_w = base_w
     target_h = target_w / max(1e-6, out_ratio)
 
-    # 如果样本框太窄，优先按高度扩宽；这样 1080p -> 720p 时景别更接近样本。
+    # 如果这样算出来的高度比样本框还矮，就改为以高度为基准扩宽。
+    # 这样 1080p -> 720p 时，景别更接近样本运镜。
     if target_h < base_h:
         target_h = base_h
         target_w = target_h * out_ratio
 
-    # 不允许超过源画幅。
+    # 不允许裁切窗口超过源画幅。
     if target_w > frame_w:
         target_w = float(frame_w)
         target_h = target_w / max(1e-6, out_ratio)
@@ -373,9 +475,9 @@ def render_sample_director_view720(
     按“运镜样本”的导播框做裁切，再输出固定 720p 画幅。
 
     这和旧版 render_single_view_crop 的区别：
-    - 不再直接用 current_anchor_x + scale_value 自己算裁切框；
-    - 改用 update_overlay_director_state 生成的 display_box_rect；
-    - 运镜的左右窗口、过渡速度、驻留和回中节奏与样本代码一致。
+        - 不再直接用 current_anchor_x + scale_value 自己算裁切框；
+        - 改用 update_overlay_director_state 生成的 display_box_rect；
+        - 运镜的左右窗口、过渡速度、驻留和回中节奏与样本代码一致。
     """
     frame_h, frame_w = frame.shape[:2]
     out_ratio = view_w / max(1.0, view_h)
@@ -409,7 +511,11 @@ def render_single_view_crop(
     view_h: int,
     crop_y_mode: str,
 ) -> Tuple[np.ndarray, Tuple[int, int, int, int]]:
-    """根据单图导播状态裁切并 resize 到输出尺寸。"""
+    """
+    旧版裁切逻辑：根据单图导播状态裁切并 resize 到输出尺寸。
+
+    这个函数保留给 --render-mode legacy，用于和之前的锚点+缩放方案对比。
+    """
     frame_h, frame_w = frame.shape[:2]
     out_ratio = view_w / max(1.0, view_h)
 
@@ -451,6 +557,11 @@ def draw_detections_on_view(
     frame_idx: int,
     recorder_status: str,
 ) -> np.ndarray:
+    """
+    把检测框从原始 undistorted 坐标映射到 720p view 上，并绘制调试文字。
+
+    录制默认保存干净 view；只有 --record-overlay 时才会保存这个带文字版本。
+    """
     out = view.copy()
     h, w = out.shape[:2]
     cx1, cy1, cx2, cy2 = crop_rect
@@ -470,6 +581,7 @@ def draw_detections_on_view(
         vbx = int(round((bx - cx1) * sx))
         vby = int(round((by - cy1) * sy))
 
+        # 完全在裁切窗口外的人，不画。
         if vx2 < 0 or vx1 >= w or vy2 < 0 or vy1 >= h:
             continue
 
@@ -482,6 +594,7 @@ def draw_detections_on_view(
         cv2.rectangle(out, (vx1, vy1), (vx2, vy2), color, 2)
         if 0 <= vbx < w and 0 <= vby < h:
             cv2.circle(out, (vbx, vby), 5, (0, 0, 255), -1)
+
         label = f"id={det.track_id} {det.score:.2f}"
         cv2.putText(out, label, (vx1, max(20, vy1 - 6)), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
 
@@ -497,29 +610,53 @@ def draw_detections_on_view(
 
 
 def prepare_frame_for_calib(raw_frame: np.ndarray, calib_size: Tuple[int, int], warn_state: dict) -> np.ndarray:
+    """
+    保证输入 remap 的 frame 尺寸与标定文件 image_size 一致。
+
+    最推荐：摄像头采集分辨率和标定分辨率完全一致。
+    如果不一致，这里会 resize 到标定尺寸再做 remap，避免 map 尺寸不匹配导致报错。
+    """
     calib_w, calib_h = calib_size
     if (raw_frame.shape[1], raw_frame.shape[0]) == (calib_w, calib_h):
         return raw_frame
+
     if not warn_state.get("printed_resize_warning", False):
         print(
             "[警告] 摄像头实际帧尺寸与校准 image_size 不一致，运行时会先 resize: "
             f"raw={raw_frame.shape[1]}x{raw_frame.shape[0]} calib={calib_w}x{calib_h}"
         )
         warn_state["printed_resize_warning"] = True
+
     return cv2.resize(raw_frame, (calib_w, calib_h), interpolation=cv2.INTER_LINEAR)
 
 
 def run(args: argparse.Namespace) -> None:
+    """
+    主流程：
+
+        摄像头后台采集 raw_frame
+            -> resize 到标定尺寸
+            -> 单目 undistort
+            -> 每隔 detect_interval 帧做 RKNN 检测
+            -> 检测结果平滑
+            -> 分析人物位置
+            -> 更新导播状态
+            -> 裁切 1280x720 view
+            -> 显示 / 保存 jpg / 异步录制 mp4
+    """
     signal.signal(signal.SIGINT, handle_exit_signal)
     signal.signal(signal.SIGTERM, handle_exit_signal)
 
     base.ensure_dir(args.save_dir)
     base.ensure_dir(args.record_dir)
 
+    # 加载单目标定文件，并预生成 map1/map2。
+    # single_rknn_base.load_single_camera_calib 内部使用的是普通单目 undistort，不是 stereoRectify。
     calib = base.load_single_camera_calib(args.calib_file)
     frame_w, frame_h = calib.image_size
     out_ratio = args.view_width / max(1.0, args.view_height)
 
+    # 初始化 RKNN person 检测器。检测是在 undistorted frame 上做的。
     detector = base.PersonDetector(
         model_path=args.model,
         labels_path=args.labels,
@@ -531,6 +668,7 @@ def run(args: argparse.Namespace) -> None:
         name="single-rknn",
     )
 
+    # 后台采集线程只保留最新帧，主循环不排队处理旧帧，降低画面延迟。
     cam = base.LatestFrameCamera(args.device, args.width, args.height, args.fps, name="camera").start()
     print("[信息] 等待摄像头第一帧...")
     if not cam.wait_first_frame(timeout=3.0):
@@ -542,15 +680,19 @@ def run(args: argparse.Namespace) -> None:
     last_infer_ms = 0.0
     last_detect_frame_idx = -1
 
+    # 检测框平滑器：减少目标框抖动，避免运镜窗口频繁左右晃。
     smoother = base.SmoothTracks(
         smooth=args.smooth,
         max_match_dist=args.smooth_match_dist,
         max_missing=args.smooth_max_missing,
     )
+
+    # 分析状态和导播状态分别由 predict1_weighted / predict1_director 维护。
     analysis_state = init_single_view_state()
     director_state = init_overlay_director_state(frame_w)
     fps_counter = base.FPSCounter()
 
+    # 异步录制器：默认录制干净 view，--record-overlay 时录制带框的 vis。
     recorder = AsyncFFmpegH264Recorder(
         out_dir=args.record_dir,
         fps=args.record_fps,
@@ -576,6 +718,7 @@ def run(args: argparse.Namespace) -> None:
         while not STOP_REQUESTED:
             loop_t0 = time.perf_counter()
 
+            # 只取采集线程最新帧，旧帧自动被覆盖。
             _idx, raw_frame, _ts = cam.get_latest()
             if raw_frame is None:
                 time.sleep(0.002)
@@ -583,6 +726,7 @@ def run(args: argparse.Namespace) -> None:
 
             raw_for_calib = prepare_frame_for_calib(raw_frame, calib.image_size, warn_state)
 
+            # 单目畸变矫正：核心是 cv2.remap。
             undistort_t0 = time.perf_counter()
             if args.no_undistort:
                 undistorted = raw_for_calib
@@ -596,6 +740,8 @@ def run(args: argparse.Namespace) -> None:
                 )
             undistort_t1 = time.perf_counter()
 
+            # 为了提高帧率，不是每帧都跑 RKNN。
+            # 非检测帧复用 last_results，再由 smoother 延续目标状态。
             do_detect = (frame_idx % max(1, args.detect_interval) == 0)
             if do_detect:
                 t0 = time.perf_counter()
@@ -607,6 +753,7 @@ def run(args: argparse.Namespace) -> None:
             single_detections = base.results_to_single_detections(last_results)
             last_detections = smoother.update(single_detections)
 
+            # 分析人物分布，并更新样本同款导播框。
             director_t0 = time.perf_counter()
             boxes_info = single_detections_to_boxes_info(last_detections)
             analysis = analyze_single_view_frame(boxes_info, frame_w, frame_h, analysis_state)
@@ -619,6 +766,7 @@ def run(args: argparse.Namespace) -> None:
             )
             director_t1 = time.perf_counter()
 
+            # 根据导播状态裁切输出 view。
             view_t0 = time.perf_counter()
             if args.render_mode == "legacy":
                 view, crop_rect = render_single_view_crop(
@@ -645,6 +793,7 @@ def run(args: argparse.Namespace) -> None:
             view_ms = (view_t1 - view_t0) * 1000.0
             fps = fps_counter.update()
 
+            # vis 是带检测框/状态文字的调试画面；view 是干净输出画面。
             vis = draw_detections_on_view(
                 view,
                 last_detections,
@@ -659,6 +808,7 @@ def run(args: argparse.Namespace) -> None:
                 recorder_status=recorder.status_text(),
             )
 
+            # 录制节流：按 record_fps 提交帧给后台 ffmpeg。
             if recorder.is_recording:
                 now_rec = time.time()
                 record_interval = 1.0 / max(1e-6, args.record_fps)
@@ -668,10 +818,13 @@ def run(args: argparse.Namespace) -> None:
                 record_frame = vis if args.record_overlay else view
                 submit_count = 0
                 max_catchup_submit = 3
+
                 while now_rec + 1e-9 >= next_record_submit_t and submit_count < max_catchup_submit:
                     recorder.submit(record_frame)
                     next_record_submit_t += record_interval
                     submit_count += 1
+
+                # 如果处理卡顿太久，不补太多旧帧，直接跟上当前时间。
                 if now_rec - next_record_submit_t > record_interval * max_catchup_submit:
                     next_record_submit_t = now_rec + record_interval
 
@@ -682,6 +835,7 @@ def run(args: argparse.Namespace) -> None:
             else:
                 key = 255
 
+            # 兼容终端按键。注意 single_rknn_base.read_terminal_key 需要回车。
             term_key = base.read_terminal_key()
             if term_key != 255:
                 key = term_key
@@ -689,6 +843,7 @@ def run(args: argparse.Namespace) -> None:
             if key in (ord("q"), 27):
                 print("[信息] 用户退出")
                 break
+
             elif key in (ord("r"), ord(" ")):
                 if recorder.is_recording:
                     recorder.stop()
@@ -696,6 +851,7 @@ def run(args: argparse.Namespace) -> None:
                     first_frame = vis if args.record_overlay else view
                     recorder.start(first_frame)
                     next_record_submit_t = 0.0
+
             elif key == ord("s"):
                 path = os.path.join(args.save_dir, f"single_view720_{debug_idx:04d}_{base.current_timestamp()}.jpg")
                 cv2.imwrite(path, vis)
@@ -740,8 +896,10 @@ def run(args: argparse.Namespace) -> None:
 
 
 def parse_args() -> argparse.Namespace:
+    """命令行参数集中放在这里，方便你后续按实验场景改默认值。"""
     parser = argparse.ArgumentParser(description="单路 USB3 RKNN + 单目矫正 + 运镜 + 1280x720 本地录制")
 
+    # 摄像头与标定文件。
     parser.add_argument("--device", default=base.DEFAULT_DEVICE, help="摄像头设备节点")
     parser.add_argument("--width", type=int, default=1920, help="摄像头采集宽度")
     parser.add_argument("--height", type=int, default=1080, help="摄像头采集高度")
@@ -749,6 +907,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--calib-file", default=base.DEFAULT_CALIB_FILE, help="单目相机校准 npz 文件")
     parser.add_argument("--no-undistort", action="store_true", help="调试用：不做畸变矫正，直接使用原图")
 
+    # RKNN 模型与检测阈值。
     parser.add_argument("--model", default=base.DEFAULT_MODEL)
     parser.add_argument("--labels", default=base.DEFAULT_LABELS)
     parser.add_argument("--conf", type=float, default=0.25)
@@ -757,6 +916,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--rknn-core", type=int, default=-1, help="-1=全部 NPU core；0/1/2=指定单核")
     parser.add_argument("--bgr-input", action="store_true", help="如果模型输入是 BGR，则打开此项；默认 RGB")
 
+    # 运镜输出尺寸与裁切策略。
     parser.add_argument("--view-width", type=int, default=1280, help="运镜输出宽度；720p 推荐 1280")
     parser.add_argument("--view-height", type=int, default=720, help="运镜输出高度；720p 固定为 720")
     parser.add_argument(
@@ -772,15 +932,18 @@ def parse_args() -> argparse.Namespace:
         help="旧版 legacy 渲染模式下的纵向裁剪策略；sample 模式下不使用",
     )
 
+    # 检测频率与平滑参数。
     parser.add_argument("--detect-interval", type=int, default=3, help="每隔 N 帧做一次 RKNN 检测")
     parser.add_argument("--smooth", type=float, default=0.70)
     parser.add_argument("--smooth-match-dist", type=float, default=180.0)
     parser.add_argument("--smooth-max-missing", type=int, default=20)
 
+    # 显示和截图。
     parser.add_argument("--display-scale", type=float, default=0.5)
     parser.add_argument("--headless", action="store_true")
     parser.add_argument("--save-dir", default=base.DEFAULT_SAVE_DIR)
 
+    # 本地视频录制。
     parser.add_argument("--record-dir", default=base.DEFAULT_RECORD_DIR, help="本地运镜视频保存目录")
     parser.add_argument("--record-fps", type=float, default=20.0, help="录制文件帧率，建议 20")
     parser.add_argument("--record-bitrate", default="8M", help="H.264 码率，例如 6M/8M/12M")
@@ -788,6 +951,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--record-queue-size", type=int, default=60, help="录制后台队列大小，满了会丢旧帧")
     parser.add_argument("--record-overlay", action="store_true", help="打开后录制带检测框/状态文字的画面；默认录制干净 view")
 
+    # 性能日志。
     parser.add_argument("--print-every", type=int, default=30)
 
     return parser.parse_args()

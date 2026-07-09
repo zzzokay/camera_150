@@ -1,0 +1,14 @@
+# mediamtx_rk3588.yml
+#
+# 用途：
+#   给 RK3588 本机 MediaMTX 使用，让 FFmpeg 可以推流到：
+#       rtsp://127.0.0.1:8554/director
+#
+# VLC / ffplay / OBS 拉流：
+#       rtsp://RK3588的IP:8554/director
+
+rtspAddress: :8554
+
+paths:
+  director:
+    source: publisher

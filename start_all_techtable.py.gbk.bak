@@ -1,0 +1,219 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+"""
+start_all_techtable.py
+
+一键启动 RK3588 篮球自动导播 + 技术台系统。
+
+功能：
+    1. 新开终端启动 mediamtx RTSP 服务
+    2. 新开终端启动 RKNN 自动导播推流脚本
+    3. 新开终端启动 mini_techtable 网页技术台
+    4. 新开终端启动 techtable_v2 RK 本地面板
+
+使用：
+    python3 start_all_techtable.py
+"""
+
+import os
+import shutil
+import subprocess
+import time
+
+
+def find_terminal():
+    """
+    自动查找当前系统可用的终端程序。
+    RK3588 Ubuntu 桌面常见可能是 gnome-terminal、xfce4-terminal、lxterminal、xterm。
+    """
+    candidates = [
+        "gnome-terminal",
+        "xfce4-terminal",
+        "lxterminal",
+        "mate-terminal",
+        "konsole",
+        "xterm",
+    ]
+
+    for term in candidates:
+        path = shutil.which(term)
+        if path:
+            return term
+
+    return None
+
+
+def build_terminal_command(term, title, command):
+    """
+    根据不同终端程序生成启动命令。
+    每个终端执行完命令后不会立刻关闭，方便你看日志。
+    """
+
+    full_command = f"""
+{command}
+
+echo
+echo "=================================================="
+echo "[{title}] 进程已退出。"
+echo "按 Enter 关闭此终端..."
+echo "=================================================="
+read
+"""
+
+    if term == "gnome-terminal":
+        return [
+            "gnome-terminal",
+            "--title",
+            title,
+            "--",
+            "bash",
+            "-lc",
+            full_command,
+        ]
+
+    elif term == "xfce4-terminal":
+        return [
+            "xfce4-terminal",
+            "--title",
+            title,
+            "--command",
+            f"bash -lc {repr(full_command)}",
+        ]
+
+    elif term == "lxterminal":
+        return [
+            "lxterminal",
+            "--title",
+            title,
+            "-e",
+            "bash",
+            "-lc",
+            full_command,
+        ]
+
+    elif term == "mate-terminal":
+        return [
+            "mate-terminal",
+            "--title",
+            title,
+            "--",
+            "bash",
+            "-lc",
+            full_command,
+        ]
+
+    elif term == "konsole":
+        return [
+            "konsole",
+            "--new-tab",
+            "-p",
+            f"tabtitle={title}",
+            "-e",
+            "bash",
+            "-lc",
+            full_command,
+        ]
+
+    elif term == "xterm":
+        return [
+            "xterm",
+            "-T",
+            title,
+            "-e",
+            "bash",
+            "-lc",
+            full_command,
+        ]
+
+    else:
+        raise RuntimeError("没有找到可用的终端程序")
+
+
+def open_terminal(term, title, command):
+    print(f"[启动] {title}")
+    cmd = build_terminal_command(term, title, command)
+    subprocess.Popen(cmd)
+
+
+def main():
+    # 保证 GUI 程序能连到当前显示桌面
+    os.environ["DISPLAY"] = ":0"
+
+    term = find_terminal()
+
+    if term is None:
+        print("错误：没有找到可用的终端程序。")
+        print("请先安装一个终端，例如：")
+        print("sudo apt install gnome-terminal")
+        return
+
+    print(f"使用终端程序：{term}")
+
+    # 1. mediamtx RTSP 服务器
+    cmd_mediamtx = r"""
+cd ~/stream_server
+./mediamtx mediamtx_rk3588.yml
+"""
+
+    # 2. 自动导播 + RKNN + RTSP 推流
+    cmd_director = r"""
+export DISPLAY=:0
+cd /home/elf/work/camera_150/camera_movement_modified
+
+python3 single_rknn_director_view720_network_stream.py \
+  --device /dev/video41 \
+  --calib-file /home/elf/work/camera_150/camera_usb3_calib.npz \
+  --model /home/elf/work/camera_150/model/basketball_player_fp_2.1.0.rknn \
+  --labels /home/elf/work/camera_150/model/labels.txt \
+  --render-mode sample \
+  --stream-mode rtsp \
+  --stream-url rtsp://127.0.0.1:8554/director \
+  --stream-fps 25 \
+  --stream-bitrate 4M \
+  --stream-encoder h264_rkmpp
+"""
+
+    # 3. mini_techtable 网页技术台
+    cmd_mini_techtable = r"""
+cd /home/elf/work/camera_150
+python3 techtable/mini_techtable.py --host 0.0.0.0 --port 8000
+"""
+
+    # 4. techtable_v2 RK 本地面板
+    #
+    # 注意：
+    # mini_techtable 已经用了 8000 端口。
+    # 所以这里建议使用 8010，避免端口冲突。
+    cmd_rk_panel = r"""
+export DISPLAY=:0
+cd /home/elf/work/camera_150
+
+python3 techtable_v2/rk_techtable_panel.py \
+  --rtsp rtsp://127.0.0.1:8554/director \
+  --state techtable_v2/game_state.json \
+  --roster techtable_v2/sample_roster.json \
+  --state-host 0.0.0.0 \
+  --state-port 8010
+"""
+
+    # 启动顺序建议：
+    # 先 mediamtx，再推流，再技术台，再 RK 面板。
+    open_terminal(term, "1_mediamtx_rtsp_server", cmd_mediamtx)
+    time.sleep(1.5)
+
+    open_terminal(term, "2_rknn_director_stream", cmd_director)
+    time.sleep(2.0)
+
+    open_terminal(term, "3_mini_techtable_web", cmd_mini_techtable)
+    time.sleep(1.0)
+
+    open_terminal(term, "4_rk_techtable_panel", cmd_rk_panel)
+
+    print()
+    print("全部启动命令已发送。")
+    print("请查看 4 个新终端窗口中的运行日志。")
+
+
+if __name__ == "__main__":
+    main()

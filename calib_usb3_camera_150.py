@@ -66,7 +66,7 @@ DEFAULT_BOARD_ROWS = 8           # 纵向内角点数量（= 方格纵向数 - 1
 # DEFAULT_SQUARE_SIZE = 3.0
 DEFAULT_SQUARE_SIZE = 22.0
 # USB 摄像头实时畸变矫正后图片保存目录
-USB_UNDISTORT_SAVE_DIR = "/home/elf/work/basketball/stereo_undistorted_calib/Single"
+USB_UNDISTORT_SAVE_DIR = "/home/elf/work/camera_150/stereo_undistorted_calib/Single"
 # =============================================================================
 # 摄像头默认参数
 # =============================================================================
@@ -1370,7 +1370,7 @@ def parse_args():
     parser.add_argument(
         "--display-scale",
         type=float,
-        default=0.5,
+        default=0.45,
         help="显示缩放比例。1920x1080 屏幕太大时建议 0.5"
     )
 

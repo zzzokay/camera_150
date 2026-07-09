@@ -58,7 +58,7 @@ CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
 if CURRENT_DIR not in sys.path:
     sys.path.insert(0, CURRENT_DIR)
 
-from scoreboard_overlay import draw_scoreboard
+# LCD 主控端不再把比分条画进视频帧，比分/时间改为放在视频上方 UI 区域。
 from state_store import (
     atomic_write_json,
     default_roster,
@@ -71,6 +71,189 @@ from state_store import (
     make_snapshot,
     save_event,
 )
+
+INDEX_HTML = r"""<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>篮球技术台 V2 网页计分</title>
+<style>
+body { margin:0; font-family:Arial,"Microsoft YaHei",sans-serif; background:#111827; color:#f9fafb; }
+.wrap { max-width:900px; margin:0 auto; padding:16px; }
+.card { background:#1f2937; border-radius:14px; padding:16px; margin-bottom:14px; }
+.score { text-align:center; font-size:48px; font-weight:900; margin:10px 0; }
+.meta { text-align:center; font-size:22px; color:#fde68a; }
+.row { display:flex; flex-wrap:wrap; gap:10px; margin:10px 0; align-items:center; }
+button { border:0; border-radius:12px; padding:15px 20px; font-size:20px; font-weight:800; cursor:pointer; }
+.home { background:#93c5fd; }
+.away { background:#fca5a5; }
+.warn { background:#fcd34d; }
+.danger { background:#f87171; }
+.ok { background:#86efac; }
+input { font-size:18px; padding:10px; border-radius:8px; border:1px solid #475569; background:#0f172a; color:white; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <div class="card">
+    <div class="score">
+      <span id="homeName">主队</span>
+      <span id="homeScore">0</span> :
+      <span id="awayScore">0</span>
+      <span id="awayName">客队</span>
+    </div>
+    <div class="meta">
+      第 <span id="period">1</span> 节　
+      <span id="clock">10:00</span>　
+      <span id="running">PAUSE</span>
+    </div>
+    <div class="meta" id="lastEvent">比赛未开始</div>
+  </div>
+
+  <div class="card">
+    <h2>快速记分</h2>
+    <div class="row">
+      <button class="home" onclick="act('score',{team:'home',value:1})">主队 +1</button>
+      <button class="home" onclick="act('score',{team:'home',value:2})">主队 +2</button>
+      <button class="home" onclick="act('score',{team:'home',value:3})">主队 +3</button>
+      <button class="away" onclick="act('score',{team:'away',value:1})">客队 +1</button>
+      <button class="away" onclick="act('score',{team:'away',value:2})">客队 +2</button>
+      <button class="away" onclick="act('score',{team:'away',value:3})">客队 +3</button>
+    </div>
+    <div class="row">
+      <button class="warn" onclick="act('foul',{team:'home'})">主队犯规</button>
+      <button class="warn" onclick="act('foul',{team:'away'})">客队犯规</button>
+      <button class="danger" onclick="act('undo',{})">撤销</button>
+    </div>
+  </div>
+
+  <div class="card">
+    <h2>时间 / 节次</h2>
+    <div class="row">
+      <button class="ok" onclick="act('clock_toggle',{})">开始 / 暂停</button>
+      <button class="warn" onclick="act('reset_clock',{})">重置时间</button>
+      <button onclick="act('next_period',{})">下一节</button>
+    </div>
+    <div class="row">
+      <button onclick="act('set_period',{period:1})">第1节</button>
+      <button onclick="act('set_period',{period:2})">第2节</button>
+      <button onclick="act('set_period',{period:3})">第3节</button>
+      <button onclick="act('set_period',{period:4})">第4节</button>
+    </div>
+  </div>
+
+  <div class="card">
+    <h2>队名</h2>
+    <div class="row">
+      <input id="homeInput" placeholder="主队名">
+      <input id="awayInput" placeholder="客队名">
+      <button class="ok" onclick="setNames()">应用队名</button>
+    </div>
+  </div>
+</div>
+
+<script>
+function fmtClock(sec) {
+  sec = Math.max(0, Math.round(sec || 0));
+  const m = Math.floor(sec / 60).toString().padStart(2, '0');
+  const s = Math.floor(sec % 60).toString().padStart(2, '0');
+  return `${m}:${s}`;
+}
+
+async function refresh() {
+  const r = await fetch('/state?ts=' + Date.now());
+  const s = await r.json();
+  document.getElementById('homeName').textContent = s.home_name || '主队';
+  document.getElementById('awayName').textContent = s.away_name || '客队';
+  document.getElementById('homeScore').textContent = s.home_score || 0;
+  document.getElementById('awayScore').textContent = s.away_score || 0;
+  document.getElementById('period').textContent = s.period || 1;
+  document.getElementById('clock').textContent = fmtClock(s.clock_sec_left);
+  document.getElementById('running').textContent = s.clock_running ? 'RUN' : 'PAUSE';
+  document.getElementById('lastEvent').textContent = s.last_event || '';
+}
+
+async function act(action, payload) {
+  await fetch('/api/action', {
+    method:'POST',
+    headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({action, ...payload})
+  });
+  await refresh();
+}
+
+async function setNames() {
+  const home_name = document.getElementById('homeInput').value;
+  const away_name = document.getElementById('awayInput').value;
+  await act('team_names', {home_name, away_name});
+}
+
+setInterval(refresh, 500);
+refresh();
+</script>
+</body>
+</html>
+"""
+
+def apply_http_action_to_state(state: Dict[str, Any], action: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+    state = dict(state)
+
+    if action == "score":
+        team = payload.get("team")
+        value = int(payload.get("value", 1) or 1)
+        if team == "home":
+            state["home_score"] = int(state.get("home_score", 0) or 0) + value
+            state["last_event"] = f"{state.get('home_name', '主队')} +{value}"
+        elif team == "away":
+            state["away_score"] = int(state.get("away_score", 0) or 0) + value
+            state["last_event"] = f"{state.get('away_name', '客队')} +{value}"
+
+    elif action == "foul":
+        team = payload.get("team")
+        if team == "home":
+            state["home_fouls"] = int(state.get("home_fouls", 0) or 0) + 1
+            state["last_event"] = f"{state.get('home_name', '主队')} 队犯规 +1"
+        elif team == "away":
+            state["away_fouls"] = int(state.get("away_fouls", 0) or 0) + 1
+            state["last_event"] = f"{state.get('away_name', '客队')} 队犯规 +1"
+
+    elif action == "clock_toggle":
+        state["clock_running"] = not bool(state.get("clock_running", False))
+        state["last_event"] = "比赛时间开始" if state["clock_running"] else "比赛时间暂停"
+
+    elif action == "reset_clock":
+        minutes = int(state.get("period_minutes", 10) or 10)
+        state["clock_sec_left"] = minutes * 60
+        state["clock_running"] = False
+        state["last_event"] = "已重置本节时间"
+
+    elif action == "next_period":
+        period = int(state.get("period", 1) or 1) + 1
+        state["period"] = min(period, 4)
+        minutes = int(state.get("period_minutes", 10) or 10)
+        state["clock_sec_left"] = minutes * 60
+        state["clock_running"] = False
+        state["home_fouls"] = 0
+        state["away_fouls"] = 0
+        state["last_event"] = f"进入第{state['period']}节"
+
+    elif action == "set_period":
+        period = int(payload.get("period", 1) or 1)
+        state["period"] = max(1, min(period, 4))
+        state["last_event"] = f"已切换到第{state['period']}节"
+
+    elif action == "team_names":
+        state["home_name"] = str(payload.get("home_name", "")).strip() or state.get("home_name", "主队")
+        state["away_name"] = str(payload.get("away_name", "")).strip() or state.get("away_name", "客队")
+        state["last_event"] = "已更新队名"
+
+    elif action == "undo":
+        state["last_event"] = "网页端暂不支持撤销，请在 LCD 端撤销"
+
+    state["updated_at_ms"] = int(time.time() * 1000)
+    return state
+
 
 
 class StateHttpServer:
@@ -102,10 +285,18 @@ class StateHttpServer:
                 self.wfile.write(body)
 
             def do_GET(self) -> None:  # noqa: N802
-                if self.path in ("/", "/health"):
+                path = self.path.split("?", 1)[0]
+
+                if path == "/":
+                    body = INDEX_HTML.encode("utf-8")
+                    self._send(200, body, "text/html; charset=utf-8")
+                    return
+
+                if path == "/health":
                     self._send(200, b"OK", "text/plain; charset=utf-8")
                     return
-                if self.path.startswith("/state"):
+
+                if path == "/state":
                     try:
                         with open(state_path, "rb") as f:
                             body = f.read()
@@ -114,7 +305,38 @@ class StateHttpServer:
                         body = json.dumps({"error": str(exc)}, ensure_ascii=False).encode("utf-8")
                         self._send(500, body)
                     return
+
                 self._send(404, b"Not Found", "text/plain; charset=utf-8")
+
+
+            def do_POST(self) -> None:  # noqa: N802
+                path = self.path.split("?", 1)[0]
+
+                if path != "/api/action":
+                    self._send(404, b"Not Found", "text/plain; charset=utf-8")
+                    return
+
+                try:
+                    length = int(self.headers.get("Content-Length", "0"))
+                    raw = self.rfile.read(length).decode("utf-8") if length > 0 else "{}"
+                    payload = json.loads(raw)
+                    action = str(payload.get("action", "")).strip()
+
+                    with open(state_path, "r", encoding="utf-8") as f:
+                        state = json.load(f)
+
+                    state = apply_http_action_to_state(state, action, payload)
+                    atomic_write_json(state_path, state)
+
+                    body = json.dumps(state, ensure_ascii=False).encode("utf-8")
+                    self._send(200, body)
+
+                except Exception as exc:
+                    body = json.dumps({"error": str(exc)}, ensure_ascii=False).encode("utf-8")
+                    self._send(500, body)
+
+
+
 
             def log_message(self, fmt: str, *args) -> None:
                 return
@@ -218,6 +440,10 @@ class TechTableWindow(QMainWindow):
         self.clock_timer = QTimer(self)
         self.clock_timer.timeout.connect(self.on_clock_timer)
         self.clock_timer.start(200)
+        self.external_state_timer = QTimer(self)
+        self.external_state_timer.timeout.connect(self.reload_state_from_file)
+        self.external_state_timer.start(300)
+
 
     def _upgrade_state(self, state: Dict[str, Any], roster: Dict[str, Any]) -> Dict[str, Any]:
         """兼容第一版或手写 JSON。"""
@@ -248,6 +474,32 @@ class TechTableWindow(QMainWindow):
         left = QWidget()
         left_layout = QVBoxLayout(left)
         left_layout.setContentsMargins(0, 0, 4, 0)
+        left_layout.setSpacing(4)
+
+        # LCD 顶部比分条：放在视频画面上方的 UI 区域，不再遮挡视频帧。
+        top_score_bar = QWidget()
+        top_score_layout = QHBoxLayout(top_score_bar)
+        top_score_layout.setContentsMargins(8, 4, 8, 4)
+        top_score_layout.setSpacing(8)
+        top_score_bar.setStyleSheet("background:#050505; border-radius:4px;")
+
+        self.score_label = QLabel()
+        self.score_label.setAlignment(Qt.AlignCenter)
+        self.score_label.setMinimumHeight(48)
+        self.score_label.setStyleSheet(
+            "font-size:26px; font-weight:bold; padding:4px; background:#111; color:white; border-radius:4px;"
+        )
+
+        self.clock_label = QLabel()
+        self.clock_label.setAlignment(Qt.AlignCenter)
+        self.clock_label.setMinimumHeight(48)
+        self.clock_label.setStyleSheet(
+            "font-size:22px; font-weight:bold; padding:4px; background:#222; color:#ffe28a; border-radius:4px;"
+        )
+
+        top_score_layout.addWidget(self.score_label, stretch=3)
+        top_score_layout.addWidget(self.clock_label, stretch=2)
+        left_layout.addWidget(top_score_bar, stretch=0)
 
         self.video_label = QLabel("等待视频流……")
         self.video_label.setAlignment(Qt.AlignCenter)
@@ -266,16 +518,6 @@ class TechTableWindow(QMainWindow):
         right_layout = QVBoxLayout(right)
         right_layout.setContentsMargins(4, 0, 0, 0)
         right_layout.setSpacing(4)
-
-        self.score_label = QLabel()
-        self.score_label.setAlignment(Qt.AlignCenter)
-        self.score_label.setStyleSheet("font-size:22px; font-weight:bold; padding:4px; background:#222; color:white;")
-        right_layout.addWidget(self.score_label)
-
-        self.clock_label = QLabel()
-        self.clock_label.setAlignment(Qt.AlignCenter)
-        self.clock_label.setStyleSheet("font-size:18px; font-weight:bold; padding:3px; background:#333; color:#ffe28a;")
-        right_layout.addWidget(self.clock_label)
 
         # 队名设置
         team_box = QGroupBox("队名")
@@ -425,7 +667,7 @@ class TechTableWindow(QMainWindow):
 
     def on_frame_ready(self, frame: np.ndarray) -> None:
         self.current_frame = frame
-        frame = draw_scoreboard(frame, self.state, self.font_path)
+        # LCD 主控端只显示原始视频帧；比分/时间由视频上方的 QLabel 显示，避免遮挡画面。
         self.show_frame(frame)
 
     def show_frame(self, frame_bgr: np.ndarray) -> None:
@@ -710,6 +952,23 @@ class TechTableWindow(QMainWindow):
         event.accept()
 
 
+    def reload_state_from_file(self) -> None:
+        loaded = load_json(self.state_path)
+        if not loaded:
+            return
+
+        old_ts = int(self.state.get("updated_at_ms", 0) or 0)
+        new_ts = int(loaded.get("updated_at_ms", 0) or 0)
+
+        if new_ts > old_ts:
+            self.state = self._upgrade_state(loaded, {
+                "home_name": loaded.get("home_name", "主队"),
+                "away_name": loaded.get("away_name", "客队"),
+                "players": loaded.get("players", {}),
+            })
+            self.refresh_ui_from_state()
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="篮球技术台 V2.1：RK主控 + 状态同步 + 客户端侧比分叠加")
     parser.add_argument("--rtsp", default="rtsp://127.0.0.1:8554/director", help="RTSP 拉流地址")
@@ -719,8 +978,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--font", default=None, help="中文字体路径，例如 /usr/share/fonts/truetype/wqy/wqy-zenhei.ttc")
     parser.add_argument("--period-minutes", type=int, default=10, help="每节默认分钟数")
     parser.add_argument("--preview-fps", type=float, default=25.0, help="本地预览帧率")
-    parser.add_argument("--window-width", type=int, default=700, help="窗口宽度")
-    parser.add_argument("--window-height", type=int, default=400, help="窗口高度")
+    parser.add_argument("--window-width", type=int, default=600, help="窗口宽度")
+    parser.add_argument("--window-height", type=int, default=350, help="窗口高度")
     parser.add_argument("--serve-state", dest="serve_state", action="store_true", default=True, help="开启 HTTP 状态服务，默认开启")
     parser.add_argument("--no-serve-state", dest="serve_state", action="store_false", help="关闭 HTTP 状态服务")
     parser.add_argument("--state-host", default="0.0.0.0", help="状态服务监听地址")
